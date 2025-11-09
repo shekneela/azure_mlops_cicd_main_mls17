@@ -1,85 +1,109 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
-# Licensed under the MIT License.
-"""
-Trains ML model using training dataset and evaluates using test dataset. Saves trained model.
-"""
-
 import argparse
-from pathlib import Path
+import os
 import pandas as pd
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import recall_score, confusion_matrix
+import numpy as np
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import joblib
 import mlflow
 import mlflow.sklearn
-from matplotlib import pyplot as plt
 
-def parse_args():
-    '''Parse input arguments'''
 
-    parser = argparse.ArgumentParser("train")
-    parser.add_argument("--train_data", type=str, help="Path to train dataset")
-    parser.add_argument("--test_data", type=str, help="Path to test dataset")
-    parser.add_argument("--model_output", type=str, help="Path of output model")
-    parser.add_argument('--criterion', type=str, default='gini',
-                        help='The function to measure the quality of a split')
-    parser.add_argument('--max_depth', type=int, default=None,
-                        help='The maximum depth of the tree. If None, then nodes are expanded until all the leaves contain less than min_samples_split samples.')
+def load_data(folder, filename):
+    path = os.path.join(folder, filename)
+    return pd.read_csv(path)
 
-    args = parser.parse_args()
-
-    return args
 
 def main(args):
-    '''Read train and test datasets, train model, evaluate model, save trained model'''
-
-    # Read train and test data from CSV
-    train_df = pd.read_csv(Path(args.train_data)/"train.csv")
-    test_df = pd.read_csv(Path(args.test_data)/"test.csv")
-
-    # Split the data into input(X) and output(y)
-    y_train = train_df['class']
-    X_train = train_df.drop(columns=['class'])
-    y_test = test_df['class']
-    X_test = test_df.drop(columns=['class'])
-
-    # Initialize and train a Decision Tree Classifier
-    model = DecisionTreeClassifier(criterion=args.criterion, max_depth=args.max_depth)
-    model.fit(X_train, y_train)
-
-    # Log model hyperparameters
-    mlflow.log_param("model", "DecisionTreeClassifier")
-    mlflow.log_param("criterion", args.criterion)
-    mlflow.log_param("max_depth", args.max_depth)
-
-    # Predict using the Decision Tree Model on test data
-    yhat_test = model.predict(X_test)
-
-    # Compute and log recall score for test data
-    recall = recall_score(y_test, yhat_test)
-    print('Recall of Decision Tree classifier on test set: {:.2f}'.format(recall))
-    mlflow.log_metric("Recall", float(recall))
-
-    # Save the model
-    mlflow.sklearn.save_model(sk_model=model, path=args.model_output)
-
-if __name__ == "__main__":
-    
     mlflow.start_run()
 
-    # Parse Arguments
-    args = parse_args()
+    # Load train and test data
+    train_df = load_data(args.train_data, "train.csv")
+    test_df = load_data(args.test_data, "test.csv")
 
-    lines = [
-        f"Train dataset input path: {args.train_data}",
-        f"Test dataset input path: {args.test_data}",
-        f"Model output path: {args.model_output}",
-        f"Criterion: {args.criterion}",
-        f"Max Depth: {args.max_depth}"
-    ]
+    target_col = "price"
+    feature_cols = [c for c in train_df.columns if c != target_col]
 
-    for line in lines:
-        print(line)
+    X_train = train_df[feature_cols]
+    y_train = train_df[target_col]
 
-    main(args)
+    X_test = test_df[feature_cols]
+    y_test = test_df[target_col]
+
+    # Feature engineering: define categorical and numeric columns
+    categorical_features = ["Segment"]
+    numeric_features = [c for c in feature_cols if c != "Segment"]
+
+    numeric_transformer = Pipeline(steps=[
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
+    )
+
+    # Define model
+    rf = RandomForestRegressor(
+        n_estimators=args.n_estimators,
+        max_depth=args.max_depth,
+        random_state=42,
+        n_jobs=-1,
+    )
+
+    # Build full pipeline
+    model_pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("model", rf),
+    ])
+
+    # Train
+    model_pipeline.fit(X_train, y_train)
+
+    # Predict and evaluate
+    y_pred = model_pipeline.predict(X_test)
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+
+    print(f"MAE: {mae:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"R^2: {r2:.4f}")
+
+    # Log parameters and metrics
+    mlflow.log_param("n_estimators", args.n_estimators)
+    mlflow.log_param("max_depth", args.max_depth)
+    mlflow.log_metric("mae", mae)
+    mlflow.log_metric("rmse", rmse)
+    mlflow.log_metric("r2", r2)
+
+    # Save model
+    os.makedirs(args.model_output, exist_ok=True)
+    model_path = os.path.join(args.model_output, "model.joblib")
+    joblib.dump(model_pipeline, model_path)
+
+    # Log model to MLflow
+    mlflow.sklearn.log_model(model_pipeline, "model")
 
     mlflow.end_run()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_data", type=str, required=True)
+    parser.add_argument("--test_data", type=str, required=True)
+    parser.add_argument("--model_output", type=str, required=True)
+    parser.add_argument("--n-estimators", type=int, default=200)
+    parser.add_argument("--max-depth", type=int, default=None)
+    args = parser.parse_args()
+    main(args)
